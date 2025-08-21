@@ -1,15 +1,15 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from scipy.signal import argrelextrema
 from scipy.stats import norm
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from io import BytesIO
 import math
 import warnings
 import plotly.graph_objs as go
+from plotly.subplots import make_subplots
 import json
 import time
 
@@ -45,6 +45,7 @@ def find_two_supports(prices, order=5):
     return core_support, second_support, resistance
 
 def compute_wheel_stock_score(tkr):
+    """0-1 composite that prefers uptrends, lower volatility, and smaller drawdowns."""
     try:
         tk = yf.Ticker(tkr)
         hist = tk.history(period="6mo")
@@ -84,11 +85,34 @@ def put_delta(S, K, T, iv, r=RISK_FREE):
     d1 = (np.log(S/K) + (r + 0.5*iv*iv) * T) / (iv * np.sqrt(T))
     return norm.cdf(d1) - 1.0
 
+# ---------- Technical indicators ----------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    out = 100 - (100 / (1 + rs))
+    return out
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def bbands(series: pd.Series, window: int = 20, n_std: float = 2.0):
+    mid = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    return mid, upper, lower
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_expiries_for_tickers(tickers):
-    """Return a sorted set of expiries across all tickers using Yahoo's native lists.
-       Includes a small delay and one retry to reduce 429s.
-    """
     expiries = set()
     for t in tickers:
         if not t:
@@ -98,7 +122,6 @@ def fetch_expiries_for_tickers(tickers):
             opts = tk.options or []
             expiries.update(opts)
         except Exception:
-            # Retry once after a brief pause
             time.sleep(1.0)
             try:
                 tk = yf.Ticker(t)
@@ -107,7 +130,7 @@ def fetch_expiries_for_tickers(tickers):
             except Exception:
                 pass
         finally:
-            time.sleep(0.4)  # gentle pacing to avoid rate limits
+            time.sleep(0.4)
     return sorted(expiries)
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -125,7 +148,11 @@ def choose_lookback_by_dte(dte: int) -> int:
     else:
         return 365  # ~12 months
 
-def make_chart(ticker, dte, strike=None, net_strike=None):
+def make_chart(
+    ticker, dte, strike=None, net_strike=None, *,
+    show_rsi=False, show_macd=False, show_bb=False,
+    show_ma21=False, show_ma50=False, show_ma200=False
+):
     lookback = choose_lookback_by_dte(dte or 30)
     hist = get_history(ticker, lookback)
     if hist.empty:
@@ -133,50 +160,101 @@ def make_chart(ticker, dte, strike=None, net_strike=None):
 
     close = hist["Close"].copy()
     core_sup, second_sup, resistance = find_two_supports(close)
-    ma21  = close.rolling(21).mean()
-    ma50  = close.rolling(50).mean()
-    ma200 = close.rolling(200).mean()
 
-    fig = go.Figure()
+    # Precompute overlays
+    ma21  = close.rolling(21).mean() if show_ma21 else None
+    ma50  = close.rolling(50).mean() if show_ma50 else None
+    ma200 = close.rolling(200).mean() if show_ma200 else None
+
+    # Dynamic layout
+    rows = 1 + int(show_rsi) + int(show_macd)
+    row_heights = [0.6]
+    titles = ["Price"]
+    if show_rsi:
+        row_heights.append(0.2)
+        titles.append("RSI (14)")
+    if show_macd:
+        row_heights.append(0.2)
+        titles.append("MACD (12,26,9)")
+
+    fig = make_subplots(
+        rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=row_heights, subplot_titles=titles
+    )
+
+    price_row = 1
+    next_row = 2
+    rsi_row = next_row if show_rsi else None
+    next_row = next_row + 1 if show_rsi else next_row
+    macd_row = next_row if show_macd else None
 
     # Candlestick
     fig.add_trace(go.Candlestick(
         x=hist.index,
         open=hist["Open"], high=hist["High"], low=hist["Low"], close=hist["Close"],
         name="Price", showlegend=False
-    ))
+    ), row=price_row, col=1)
 
-    # Moving averages
-    fig.add_trace(go.Scatter(x=hist.index, y=ma21,  mode="lines", name="21d MA"))
-    fig.add_trace(go.Scatter(x=hist.index, y=ma50,  mode="lines", name="50d MA"))
-    if not ma200.dropna().empty:
-        fig.add_trace(go.Scatter(x=hist.index, y=ma200, mode="lines", name="200d MA"))
+    # Moving averages via toggles
+    if show_ma21:
+        fig.add_trace(go.Scatter(x=hist.index, y=ma21,  mode="lines", name="21d MA"), row=price_row, col=1)
+    if show_ma50:
+        fig.add_trace(go.Scatter(x=hist.index, y=ma50,  mode="lines", name="50d MA"), row=price_row, col=1)
+    if show_ma200 and ma200 is not None and not ma200.dropna().empty:
+        fig.add_trace(go.Scatter(x=hist.index, y=ma200, mode="lines", name="200d MA"), row=price_row, col=1)
 
-    # Horizontal levels
+    # Bollinger Bands on price
+    if show_bb:
+        mid, upper, lower = bbands(close, window=20, n_std=2.0)
+        fig.add_trace(go.Scatter(x=hist.index, y=mid,   mode="lines", name="BB mid (20)"), row=price_row, col=1)
+        fig.add_trace(go.Scatter(x=hist.index, y=upper, mode="lines", name="BB upper"), row=price_row, col=1)
+        fig.add_trace(go.Scatter(x=hist.index, y=lower, mode="lines", name="BB lower"), row=price_row, col=1)
+
+    # Horizontal levels on price
     shapes = []
     annots = []
-    def hline(y, label, color):
+    def hline_price(y, label):
         if y is None: 
             return
         shapes.append(dict(type="line", xref="paper", x0=0, x1=1, yref="y", y0=y, y1=y,
-                           line=dict(color=color, width=1.5, dash="dot")))
+                           line=dict(width=1.5, dash="dot")))
         annots.append(dict(x=1.002, xref="paper", y=y, yref="y",
-                           text=label, showarrow=False, font=dict(size=10, color=color),
+                           text=label, showarrow=False, font=dict(size=10),
                            xanchor="left", bgcolor="rgba(255,255,255,0.5)"))
 
-    hline(core_sup,   "Core support",  "#2ca02c")
-    hline(second_sup, "2nd support",   "#98df8a")
-    hline(resistance, "Resistance",    "#d62728")
+    hline_price(core_sup,   "Core support")
+    hline_price(second_sup, "2nd support")
+    hline_price(resistance, "Resistance")
     if strike is not None:
-        hline(strike, "Strike",        "#1f77b4")
+        hline_price(strike, "Strike")
     if net_strike is not None:
-        hline(net_strike, "Net strike", "#17becf")
+        hline_price(net_strike, "Net strike")
 
+    # RSI panel
+    if show_rsi and rsi_row is not None:
+        r = rsi(close, 14)
+        fig.add_trace(go.Scatter(x=hist.index, y=r, mode="lines", name="RSI (14)"), row=rsi_row, col=1)
+        # RSI 30/70 guides as lines (avoid shape yref issues)
+        thirty = pd.Series(30, index=hist.index)
+        seventy = pd.Series(70, index=hist.index)
+        fig.add_trace(go.Scatter(x=hist.index, y=thirty, mode="lines", name="RSI 30", line=dict(dash="dot")), row=rsi_row, col=1)
+        fig.add_trace(go.Scatter(x=hist.index, y=seventy, mode="lines", name="RSI 70", line=dict(dash="dot")), row=rsi_row, col=1)
+
+    # MACD panel
+    if show_macd and macd_row is not None:
+        m_line, s_line, histo = macd(close)
+        fig.add_trace(go.Bar(x=hist.index, y=histo, name="MACD hist"), row=macd_row, col=1)
+        fig.add_trace(go.Scatter(x=hist.index, y=m_line, mode="lines", name="MACD"), row=macd_row, col=1)
+        fig.add_trace(go.Scatter(x=hist.index, y=s_line, mode="lines", name="Signal"), row=macd_row, col=1)
+
+    # Only show rangeslider when there is a single (price) row,
+    # otherwise it can overlap the bottom indicators.
     fig.update_layout(
-        height=520,
-        xaxis_title="Date", yaxis_title="Price",
+        height=520 if rows == 1 else (680 if rows == 2 else 860),
+        margin=dict(l=40, r=120, t=40, b=40),
         shapes=shapes, annotations=annots,
-        margin=dict(l=40, r=120, t=40, b=40)
+        xaxis_title="Date", yaxis_title="Price",
+        xaxis_rangeslider_visible=(rows == 1)
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -185,7 +263,6 @@ def _fill_last_price(puts: pd.DataFrame) -> pd.Series:
     bid = pd.to_numeric(puts.get("bid"), errors="coerce")
     ask = pd.to_numeric(puts.get("ask"), errors="coerce")
     mid = (bid + ask) / 2.0
-    # prefer lastPrice>0, else mid>0, else bid>0
     lp2 = lp.where(lp > 0)
     lp2 = lp2.fillna(mid.where(mid > 0))
     lp2 = lp2.fillna(bid.where(bid > 0))
@@ -207,10 +284,8 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
             continue
         price = float(h1d["Close"].iloc[-1])
 
-        # Supports (kept minimal)
         h90 = tk.history(period="90d")["Close"]
         core_sup, second_sup, resistance = find_two_supports(h90)
-        ma21 = float(h90.rolling(21).mean().iloc[-1]) if len(h90) >= 21 else None
         w = tk.history(period="365d", interval="1wk")["Close"]
         week_low, _ = find_support_resistance(w)
 
@@ -231,7 +306,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
             if puts.empty:
                 continue
 
-            # Normalize columns and robust premium
             puts = puts.rename(columns={"impliedVolatility": "iv"})
             puts["lp"] = _fill_last_price(puts)
             puts = puts[(puts["lp"].notna()) & (puts["lp"] > 0) & (puts["strike"] < price)]
@@ -241,7 +315,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
 
             dte = (pd.to_datetime(expiry).date() - today).days
 
-            # ---------- Robust IV hierarchy ----------
             iv_series = pd.to_numeric(puts["iv"], errors="coerce")
             iv_median = iv_series.median() if iv_series.notna().any() else np.nan
             iv_used = iv_series.fillna(iv_median)
@@ -253,7 +326,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
             otm_pct = (price - puts["strike"]) / price
             min_otm_ok = (otm_pct >= req_pct)
 
-            # Yields (ROC only): premium / strike
             denom = puts["strike"]
             yld_pct = (puts["lp"] / denom) * 100.0
             wk_yld  = yld_pct / (dte/7.0 if dte > 0 else 1.0)
@@ -263,7 +335,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
             prem_ok  = puts["lp"] >= guard["MIN_PREMIUM_ABS"]
             wk_ok    = (wk_yld >= weekly_yield_min)
 
-            # Optional delta band
             if guard["USE_DELTA_BAND"]:
                 T = max(dte, 1) / 365.0
                 deltas = puts.apply(
@@ -312,7 +383,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
     df = pd.DataFrame(rows)
     diag = pd.DataFrame(diag_rows)
 
-    # Ranking
     if not df.empty:
         df["Comfort Score"] = pd.to_numeric(df["Yield %/wk"], errors="coerce").fillna(0.0).round(4)
         df["Rank Score"] = (pd.to_numeric(df["Comfort Score"], errors="coerce").fillna(0.0) *
@@ -330,7 +400,7 @@ def to_excel_bytes(df, diag):
     output.seek(0)
     return output.getvalue()
 
-def build_signature(tickers, expiries, weekly_min, guard):
+def build_signature(tickers, expiries, weekly_min, guard, overlays):
     sig = {
         "tickers": list(tickers),
         "expiries": list(expiries),
@@ -340,6 +410,7 @@ def build_signature(tickers, expiries, weekly_min, guard):
         "DELTA_MIN": float(guard["DELTA_MIN"]),
         "DELTA_MAX": float(guard["DELTA_MAX"]),
         "FALLBACK_MIN_OTM": float(guard["FALLBACK_MIN_OTM"]),
+        "overlays": overlays
     }
     return json.dumps(sig, sort_keys=True)
 
@@ -347,7 +418,6 @@ def build_signature(tickers, expiries, weekly_min, guard):
 st.set_page_config(page_title="Wheel Screener — Simplified ROC", layout="wide")
 st.title("Wheel Strategy Screener — Simplified (ROC only)")
 
-# Session state init
 if "wheel_results" not in st.session_state:
     st.session_state["wheel_results"] = None
 
@@ -357,7 +427,6 @@ with st.sidebar:
                                 value=",".join(DEFAULT_TICKERS), height=120)
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 
-    # Refresh expiries
     colA, colB = st.columns([1,1])
     with colA:
         refresh = st.button("Refresh expiries")
@@ -385,9 +454,26 @@ with st.sidebar:
         fallback_min_otm = st.slider("Fallback min OTM when IV missing (%)", 0.0, 10.0, 2.0, 0.5) / 100.0
         diagnostics = st.checkbox("Capture diagnostics on run", value=False)
 
+    # Updated: indicator toggles
+    with st.expander("Chart overlays"):
+        show_bb = st.checkbox("Bollinger Bands", value=False)
+        show_rsi = st.checkbox("RSI (14)", value=False)
+        show_macd = st.checkbox("MACD (12,26,9)", value=False)
+        show_ma21 = st.checkbox("21d MA", value=False)
+        show_ma50 = st.checkbox("50d MA", value=False)
+        show_ma200 = st.checkbox("200d MA", value=False)
+
+    with st.expander("Definitions"):
+        st.markdown(
+            """
+**Wheel Stock Score**: 0–1 composite that rewards an uptrend, lower volatility, and smaller drawdowns.
+**Comfort Score**: Weekly premium yield on a return-on-collateral basis (premium ÷ strike ÷ weeks to expiry × 100).
+**Rank Score**: Comfort Score × Wheel Stock Score. Higher is generally better.
+            """
+        )
+
     run = st.button("Run Screener")
 
-# Build guard dict (no DTE window, no OI filter)
 guard = {
     "MIN_PREMIUM_ABS": min_prem_abs,
     "USE_DELTA_BAND": use_delta,
@@ -395,9 +481,16 @@ guard = {
     "DELTA_MAX": dmax,
     "FALLBACK_MIN_OTM": fallback_min_otm
 }
-current_sig = build_signature(tickers, expiries, weekly_min, guard)
+overlay_sig = {
+    "bb": bool(show_bb),
+    "rsi": bool(show_rsi),
+    "macd": bool(show_macd),
+    "ma21": bool(show_ma21),
+    "ma50": bool(show_ma50),
+    "ma200": bool(show_ma200)
+}
+current_sig = build_signature(tickers, expiries, weekly_min, guard, overlay_sig)
 
-# If user pressed Run, compute and persist results
 if run:
     if not tickers:
         st.warning("Please enter at least one ticker.")
@@ -422,17 +515,28 @@ if run:
             st.session_state["wheel_results"] = None
             st.error(f"Error: {e}")
 
-# If we have prior results, show them regardless of radio toggles or other widget changes
 results = st.session_state.get("wheel_results")
 
 if results is not None:
-    # Notify if inputs changed since last run
     if results.get("signature") != current_sig:
         st.warning("Inputs changed since the last run. Press Run Screener to refresh. Showing last results.")
-    st.subheader("Candidates")
-    st.dataframe(results["df"], use_container_width=True, hide_index=True)
 
-    # --------- Contract selector and chart ---------
+    col_cfg = {
+        "Wheel Stock Score": st.column_config.NumberColumn(
+            help="0–1 composite that rewards an uptrend, lower volatility, and smaller drawdowns."
+        ),
+        "Comfort Score": st.column_config.NumberColumn(
+            help="Weekly premium yield on a return-on-collateral basis (premium ÷ strike ÷ weeks × 100)."
+        ),
+        "Rank Score": st.column_config.NumberColumn(
+            help="Comfort Score × Wheel Stock Score."
+        )
+    }
+
+    st.subheader("Candidates")
+    st.dataframe(results["df"], use_container_width=True, hide_index=True, column_config=col_cfg)
+
+    # Chart section
     st.subheader("Chart with chosen contract overlaid")
     mode = st.radio("Chart mode", ["Top-ranked per ticker", "Manual contract selector"], horizontal=True, key="chart_mode")
     df = results["df"]
@@ -443,9 +547,12 @@ if results is not None:
         strike = float(best_row["Strike"])
         net_strike = float(best_row["Net Strike"])
         st.caption(f"Top-ranked for {focus_ticker} (DTE={dte}, strike={strike:.2f}, net strike={net_strike:.2f})")
-        make_chart(focus_ticker, dte, strike=strike, net_strike=net_strike)
+        make_chart(
+            focus_ticker, dte, strike=strike, net_strike=net_strike,
+            show_rsi=show_rsi, show_macd=show_macd, show_bb=show_bb,
+            show_ma21=show_ma21, show_ma50=show_ma50, show_ma200=show_ma200
+        )
     else:
-        # Manual selection: Ticker -> Expiry -> Strike
         t_opts = sorted(df["Ticker"].unique())
         t_sel = st.selectbox("Ticker", options=t_opts, key="manual_ticker")
         df_t = df[df["Ticker"] == t_sel]
@@ -459,9 +566,12 @@ if results is not None:
         strike = float(row["Strike"])
         net_strike = float(row["Net Strike"])
         st.caption(f"Selected {t_sel} @ {e_sel}, strike={strike:.2f}, net strike={net_strike:.2f}")
-        make_chart(t_sel, dte, strike=strike, net_strike=net_strike)
+        make_chart(
+            t_sel, dte, strike=strike, net_strike=net_strike,
+            show_rsi=show_rsi, show_macd=show_macd, show_bb=show_bb,
+            show_ma21=show_ma21, show_ma50=show_ma50, show_ma200=show_ma200
+        )
 
-    # Diagnostics section
     if results.get("captured_diagnostics") and not results["diag"].empty:
         st.subheader("Diagnostics")
         st.dataframe(results["diag"], use_container_width=True, hide_index=True)
@@ -469,7 +579,6 @@ if results is not None:
         if results["diag"].empty:
             st.info("Diagnostics were not captured in the last run. Enable 'Capture diagnostics on run' and re-run.")
 
-    # Download Excel from last results
     xls = to_excel_bytes(results["df"], results["diag"])
     st.download_button("Download Excel", data=xls,
                        file_name="wheel_put_candidates_simplified.xlsx",
