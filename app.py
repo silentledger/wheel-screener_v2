@@ -16,7 +16,7 @@ import time
 warnings.filterwarnings("ignore", message="Calling float on a single element Series is deprecated")
 
 # ---------- Defaults ----------
-DEFAULT_TICKERS = ["AMD","HIMS","NBIS","AMZN","AAPL"]
+WATCHLIST = ["AMD","AMZN","AAPL","MSFT","TSLA","NVDA","META","HIMS","MARA","NBIS"]
 WEEKLY_YIELD_MIN_DEFAULT = 0.8  # % per week (ROC basis)
 OTM_K, OTM_MIN, OTM_MAX = 0.9, 0.03, 0.12   # min IV-aware OTM buffer band
 DAYS_PER_MONTH, DAYS_PER_YEAR = 30.0, 365.0
@@ -130,7 +130,7 @@ def fetch_expiries_for_tickers(tickers):
             except Exception:
                 pass
         finally:
-            time.sleep(0.4)
+            time.sleep(0.3)
     return sorted(expiries)
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -166,7 +166,6 @@ def make_chart(
     ma50  = close.rolling(50).mean() if show_ma50 else None
     ma200 = close.rolling(200).mean() if show_ma200 else None
 
-    # Dynamic layout
     rows = 1 + int(show_rsi) + int(show_macd)
     row_heights = [0.6]
     titles = ["Price"]
@@ -188,14 +187,12 @@ def make_chart(
     next_row = next_row + 1 if show_rsi else next_row
     macd_row = next_row if show_macd else None
 
-    # Candlestick
     fig.add_trace(go.Candlestick(
         x=hist.index,
         open=hist["Open"], high=hist["High"], low=hist["Low"], close=hist["Close"],
         name="Price", showlegend=False
     ), row=price_row, col=1)
 
-    # Moving averages via toggles
     if show_ma21:
         fig.add_trace(go.Scatter(x=hist.index, y=ma21,  mode="lines", name="21d MA"), row=price_row, col=1)
     if show_ma50:
@@ -203,14 +200,12 @@ def make_chart(
     if show_ma200 and ma200 is not None and not ma200.dropna().empty:
         fig.add_trace(go.Scatter(x=hist.index, y=ma200, mode="lines", name="200d MA"), row=price_row, col=1)
 
-    # Bollinger Bands on price
     if show_bb:
         mid, upper, lower = bbands(close, window=20, n_std=2.0)
         fig.add_trace(go.Scatter(x=hist.index, y=mid,   mode="lines", name="BB mid (20)"), row=price_row, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=upper, mode="lines", name="BB upper"), row=price_row, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=lower, mode="lines", name="BB lower"), row=price_row, col=1)
 
-    # Horizontal levels on price
     shapes = []
     annots = []
     def hline_price(y, label):
@@ -230,25 +225,20 @@ def make_chart(
     if net_strike is not None:
         hline_price(net_strike, "Net strike")
 
-    # RSI panel
     if show_rsi and rsi_row is not None:
         r = rsi(close, 14)
         fig.add_trace(go.Scatter(x=hist.index, y=r, mode="lines", name="RSI (14)"), row=rsi_row, col=1)
-        # RSI 30/70 guides as lines (avoid shape yref issues)
         thirty = pd.Series(30, index=hist.index)
         seventy = pd.Series(70, index=hist.index)
         fig.add_trace(go.Scatter(x=hist.index, y=thirty, mode="lines", name="RSI 30", line=dict(dash="dot")), row=rsi_row, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=seventy, mode="lines", name="RSI 70", line=dict(dash="dot")), row=rsi_row, col=1)
 
-    # MACD panel
     if show_macd and macd_row is not None:
         m_line, s_line, histo = macd(close)
         fig.add_trace(go.Bar(x=hist.index, y=histo, name="MACD hist"), row=macd_row, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=m_line, mode="lines", name="MACD"), row=macd_row, col=1)
         fig.add_trace(go.Scatter(x=hist.index, y=s_line, mode="lines", name="Signal"), row=macd_row, col=1)
 
-    # Only show rangeslider when there is a single (price) row,
-    # otherwise it can overlap the bottom indicators.
     fig.update_layout(
         height=520 if rows == 1 else (680 if rows == 2 else 860),
         margin=dict(l=40, r=120, t=40, b=40),
@@ -286,8 +276,6 @@ def build_candidates(tickers, expiries, weekly_yield_min, guard, diagnostics=Fal
 
         h90 = tk.history(period="90d")["Close"]
         core_sup, second_sup, resistance = find_two_supports(h90)
-        w = tk.history(period="365d", interval="1wk")["Close"]
-        week_low, _ = find_support_resistance(w)
 
         wheel_score = compute_wheel_stock_score(ticker)
 
@@ -422,10 +410,13 @@ if "wheel_results" not in st.session_state:
     st.session_state["wheel_results"] = None
 
 with st.sidebar:
-    st.subheader("Inputs")
-    tickers_text = st.text_area("Tickers (comma-separated)",
-                                value=",".join(DEFAULT_TICKERS), height=120)
-    tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+    st.subheader("Watchlist")
+    tickers = st.multiselect(
+        "Select tickers to screen",
+        options=WATCHLIST,
+        default=[],
+        help="Pick one or more from your built-in watchlist. No tickers are selected by default."
+    )
 
     colA, colB = st.columns([1,1])
     with colA:
@@ -439,9 +430,20 @@ with st.sidebar:
     if clear_results:
         st.session_state["wheel_results"] = None
 
+    # Expiry filter: only 21–45 DTE by default
+    today = datetime.today().date()
     available_expiries = fetch_expiries_for_tickers(tickers) if tickers else []
-    default_select = available_expiries[:2] if len(available_expiries) >= 2 else available_expiries
-    expiries = st.multiselect("Available expiries", options=available_expiries, default=default_select)
+    expiry_21_45 = [e for e in available_expiries
+                    if 21 <= (pd.to_datetime(e).date() - today).days <= 45]
+
+    exp_options = expiry_21_45 if len(expiry_21_45) > 0 else available_expiries
+    default_select = expiry_21_45 if len(expiry_21_45) > 0 else []
+
+    if tickers and len(available_expiries) > 0 and len(expiry_21_45) == 0:
+        st.info("No expiries in the 21–45 day window. Showing all available expiries so you can pick another range.")
+
+    expiries = st.multiselect("Expiries", options=exp_options, default=default_select,
+                              help="By default, shows expiries in the 21–45 DTE window when available.")
 
     st.caption("Yield basis is ROC only: premium / strike.")
     weekly_min = st.number_input("Min Weekly Yield (%/wk)", value=WEEKLY_YIELD_MIN_DEFAULT, step=0.1, min_value=0.0)
@@ -454,7 +456,6 @@ with st.sidebar:
         fallback_min_otm = st.slider("Fallback min OTM when IV missing (%)", 0.0, 10.0, 2.0, 0.5) / 100.0
         diagnostics = st.checkbox("Capture diagnostics on run", value=False)
 
-    # Updated: indicator toggles
     with st.expander("Chart overlays"):
         show_bb = st.checkbox("Bollinger Bands", value=False)
         show_rsi = st.checkbox("RSI (14)", value=False)
@@ -493,7 +494,7 @@ current_sig = build_signature(tickers, expiries, weekly_min, guard, overlay_sig)
 
 if run:
     if not tickers:
-        st.warning("Please enter at least one ticker.")
+        st.warning("Please select at least one ticker from the watchlist.")
     elif not expiries:
         st.warning("Please pick at least one expiry.")
     else:
@@ -536,7 +537,6 @@ if results is not None:
     st.subheader("Candidates")
     st.dataframe(results["df"], use_container_width=True, hide_index=True, column_config=col_cfg)
 
-    # Chart section
     st.subheader("Chart with chosen contract overlaid")
     mode = st.radio("Chart mode", ["Top-ranked per ticker", "Manual contract selector"], horizontal=True, key="chart_mode")
     df = results["df"]
@@ -584,4 +584,4 @@ if results is not None:
                        file_name="wheel_put_candidates_simplified.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Run the screener, then chart either the top-ranked contract per ticker or pick a specific contract via the selector.")
+    st.info("Select tickers, choose expiries, then run the screener. You can chart the top-ranked contract or pick one manually.")
