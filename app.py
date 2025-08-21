@@ -404,7 +404,7 @@ def build_signature(tickers, expiries, weekly_min, guard, overlays):
 
 # ---------- UI ----------
 st.set_page_config(page_title="Wheel Screener — Simplified ROC", layout="wide")
-st.title("Wheel Strategy Screener — Simplified (ROC only)")
+st.title("Wheel Strategy - Options Screener")
 
 if "wheel_results" not in st.session_state:
     st.session_state["wheel_results"] = None
