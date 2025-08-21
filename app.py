@@ -16,7 +16,8 @@ import time
 warnings.filterwarnings("ignore", message="Calling float on a single element Series is deprecated")
 
 # ---------- Defaults ----------
-WATCHLIST = ["AMD","AMZN","AAPL","MSFT","TSLA","NVDA","META","HIMS","MARA","NBIS"]
+WATCHLIST = ["AAPL","ACHR","AMD","AMZN","ASTS","AVGO","AZN","BULL","CAKE","CDLR","CLPT","COIN","CRM","DUOL","ELF","FI","FUBO","GOOG","HIMS","HNST","HOOD","IONQ","IREN","LMND","MARA","META","MSFT","MSTR","NBIS","NVDA","NVO","OSCR","PANW","PLTR","PYPL","QUBT","RBLX","RDDT","RKLB","SHOP","SMCI","SNOW","SOFI","SPY","TEM","TSLA","UNH","VIX","ZETA"
+]
 WEEKLY_YIELD_MIN_DEFAULT = 0.8  # % per week (ROC basis)
 OTM_K, OTM_MIN, OTM_MAX = 0.9, 0.03, 0.12   # min IV-aware OTM buffer band
 DAYS_PER_MONTH, DAYS_PER_YEAR = 30.0, 365.0
